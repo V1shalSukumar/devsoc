@@ -195,10 +195,20 @@ def list_reports():
             data = json.loads(f.read_text())
             reports.append({
                 "filename": f.name,
+                "id": f.name,
                 "audio_file": data.get("audio_file", ""),
                 "processed_at": data.get("processed_at", ""),
+                "timestamp": data.get("processed_at", ""),  # Map for frontend compatibility
                 "overall_risk": data.get("overall_risk", {}),
+                "risk_score": data.get("overall_risk", {}).get("score", 0),  # Direct score for frontend
                 "duration": data.get("duration_seconds"),
+                "profanity_findings": data.get("profanity_findings", []),
+                "regulatory_compliance": data.get("regulatory_compliance", {}),
+                "obligation_analysis": data.get("obligation_analysis", []),
+                "obligation_sentences": data.get("obligation_sentences", []),
+                "emotion_analysis": data.get("emotion_analysis", {}),
+                "segments": data.get("segments", []),
+                "transcript": data.get("transcript", ""),
             })
         except Exception:
             continue
