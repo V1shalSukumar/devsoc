@@ -16,6 +16,7 @@ from groq import Groq
 from layer1_audio import run_layer1
 from layer2_text import run_layer2, load_policy_rules
 from layer3_backboard import initialize_assistants, run_layer3
+from finbert_extractor import run_finbert_analysis, prepare_terms_for_explanation
 from pipeline import run_full_pipeline, save_report
 
 # Load environment variables
@@ -23,8 +24,8 @@ load_dotenv()
 
 app = FastAPI(
     title="Financial Audio Intelligence API",
-    version="2.0.0",
-    description="4-Layer compliance analysis for financial service call recordings",
+    version="2.1.0",
+    description="4-Layer compliance analysis for financial service call recordings with FinBERT-powered term extraction",
 )
 
 app.add_middleware(
@@ -67,7 +68,7 @@ def root():
         "layers": [
             "Layer 1: Audio Forensics (Groq Whisper + Librosa)",
             "Layer 2: Text Processing (spaCy + PII + Profanity)",
-            "Layer 3: Intelligence (Backboard.io — 3 Assistants)",
+            "Layer 3: Intelligence (Backboard.io — 4 Assistants + FinBERT)",
             "Layer 4: Review UI (Next.js)",
         ],
         "timestamp": datetime.now().isoformat(),
@@ -136,6 +137,46 @@ async def analyze_text(body: dict):
     result = run_layer2(transcript)
     result["status"] = "success"
     return result
+
+
+# ── FinBERT Term Analysis ────────────────────────────────────────────────────
+
+@app.post("/analyze-terms")
+async def analyze_financial_terms(body: dict):
+    """
+    Standalone FinBERT analysis: Extract financial terms and get LLM explanations.
+    
+    Input: {"transcript": "your transcript text here"}
+    
+    Returns:
+    - finbert_analysis: Important segments and extracted terms
+    - term_explanations: LLM-generated explanations for each term
+    """
+    transcript = body.get("transcript", "")
+    if not transcript.strip():
+        raise HTTPException(400, "No transcript provided")
+
+    try:
+        # Run FinBERT analysis
+        finbert_result = run_finbert_analysis(transcript)
+        financial_terms = prepare_terms_for_explanation(finbert_result)
+        
+        # Get LLM explanations if we have terms
+        if financial_terms:
+            from layer3_backboard import explain_financial_terms, initialize_assistants, _try_parse_json
+            await initialize_assistants()
+            term_explanations_raw = await explain_financial_terms(financial_terms)
+            term_explanations = _try_parse_json(term_explanations_raw)
+        else:
+            term_explanations = {"term_explanations": [], "summary": "No financial terms found."}
+        
+        return {
+            "status": "success",
+            "finbert_analysis": finbert_result,
+            "term_explanations": term_explanations,
+        }
+    except Exception as e:
+        raise HTTPException(500, f"Term analysis failed: {e}")
 
 
 # ── Full Pipeline: Audio → L1 → L2 → L3 ──────────────────────────────────

@@ -71,6 +71,8 @@ async def run_full_pipeline(audio_path: str, groq_client: Groq, language: str | 
         "text_risk_level": layer2["risk_level"],
 
         # Layer 3
+        "finbert_analysis": layer3.get("finbert_analysis"),
+        "financial_term_explanations": layer3.get("term_explanations"),
         "obligation_analysis": layer3["obligation_analysis"],
         "intent_classification": layer3["intent_classification"],
         "regulatory_compliance": layer3["regulatory_compliance"],

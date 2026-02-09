@@ -15,6 +15,7 @@ import asyncio
 import time
 from pathlib import Path
 from backboard import BackboardClient
+from finbert_extractor import run_finbert_analysis, prepare_terms_for_explanation
 
 BACKBOARD_API_KEY = os.getenv("BACKBOARD_API_KEY", "")
 
@@ -97,6 +98,27 @@ Respond ONLY with valid JSON. The top-level keys must be:
 - "overall_compliance" (string: compliant, needs_review, or non_compliant)
 - "compliance_score" (integer 0-100)
 - "recommendations" (array of strings)
+Do not include any text outside the JSON object.""",
+    },
+    "financial_term_explainer": {
+        "name": "Financial Term Explainer",
+        "system_prompt": """You are a financial education expert who explains complex financial terminology in simple, clear language.
+
+Given a list of financial terms extracted from a customer service call, provide:
+
+1. For EACH term:
+   - A clear, jargon-free explanation (1-2 sentences)
+   - Why it matters to the customer
+   - Any common misconceptions or pitfalls
+
+2. Organize terms by category (Banking, Loans, Investment, Fees, Compliance, etc.)
+
+3. Highlight any terms that are particularly important for customer decision-making
+
+Respond ONLY with valid JSON. The top-level keys must be:
+- "term_explanations" (array of objects, each with keys: "term", "category", "explanation", "customer_impact", "pitfalls")
+- "important_terms" (array of term names that are critical for customer understanding)
+- "summary" (string: brief overview of the financial topics discussed)
 Do not include any text outside the JSON object.""",
     },
 }
@@ -244,34 +266,74 @@ Provide your compliance audit in the specified JSON format."""
     return await _send_to_assistant("regulatory_checker", prompt)
 
 
+async def explain_financial_terms(terms: list[str]) -> str:
+    """Assistant 4: Explain financial terms extracted by FinBERT."""
+    if not terms:
+        return '{"term_explanations": [], "important_terms": [], "summary": "No financial terms to explain."}'
+    
+    terms_list = "\n".join(f"- {term}" for term in terms[:15])  # Limit to 15 terms
+    
+    prompt = f"""Explain the following financial terms that were identified in a customer service call:
+
+FINANCIAL TERMS:
+{terms_list}
+
+Provide clear, customer-friendly explanations for each term.
+Respond in the specified JSON format."""
+
+    return await _send_to_assistant("financial_term_explainer", prompt)
+
+
 async def run_layer3(transcript: str, layer2_data: dict) -> dict:
-    """Run all 3 Backboard assistants in parallel."""
+    """
+    Run all 4 Backboard assistants in parallel plus FinBERT analysis.
+    
+    1. FinBERT: Identify important segments and extract financial terms
+    2. Obligation Detector: Find commitments and promises
+    3. Intent Classifier: Classify call intent/sentiment
+    4. Regulatory Checker: Check compliance
+    5. Financial Term Explainer: Explain extracted terms via LLM
+    """
     # Initialize if needed
     if not _state["initialized"]:
         await initialize_assistants()
 
-    # Run all three assistants concurrently (don't crash if one fails)
+    # Step 1: Run FinBERT analysis (sync, CPU-based)
+    try:
+        finbert_result = run_finbert_analysis(transcript)
+        financial_terms = prepare_terms_for_explanation(finbert_result)
+    except Exception as e:
+        print(f"FinBERT analysis failed: {e}")
+        finbert_result = {"error": str(e), "important_segments": [], "financial_terms": []}
+        financial_terms = []
+
+    # Step 2: Run all four assistants concurrently (don't crash if one fails)
     results = await asyncio.gather(
         detect_obligations(transcript, layer2_data),
         classify_intent(transcript),
         check_regulatory_compliance(transcript, layer2_data),
+        explain_financial_terms(financial_terms),
         return_exceptions=True,
     )
 
     obligation_result = results[0] if not isinstance(results[0], Exception) else f"Error: {results[0]}"
     intent_result = results[1] if not isinstance(results[1], Exception) else f"Error: {results[1]}"
     compliance_result = results[2] if not isinstance(results[2], Exception) else f"Error: {results[2]}"
+    term_explanation_result = results[3] if not isinstance(results[3], Exception) else f"Error: {results[3]}"
 
     return {
         "layer": "backboard_intelligence",
+        "finbert_analysis": finbert_result,
         "obligation_analysis": _try_parse_json(obligation_result),
         "intent_classification": _try_parse_json(intent_result),
         "regulatory_compliance": _try_parse_json(compliance_result),
+        "term_explanations": _try_parse_json(term_explanation_result),
         "assistants_used": list(_state["assistant_ids"].keys()),
         "raw_responses": {
             "obligations": obligation_result,
             "intent": intent_result,
             "compliance": compliance_result,
+            "term_explanations": term_explanation_result,
         },
     }
 
