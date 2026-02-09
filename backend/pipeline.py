@@ -7,7 +7,6 @@ import asyncio
 import json
 from datetime import datetime
 from pathlib import Path
-from groq import Groq
 
 from layer1_audio import run_layer1
 from layer2_text import run_layer2
@@ -39,7 +38,7 @@ async def run_full_pipeline(
     start_time = datetime.now()
 
     # ── Layer 1: Audio Forensics ──────────────────────────────────────
-    layer1 = run_layer1(audio_path, groq_client, language=language)
+    layer1 = run_layer1(audio_path, language=language)
     transcript = layer1["transcript"]
 
     if not transcript or not transcript.strip():
