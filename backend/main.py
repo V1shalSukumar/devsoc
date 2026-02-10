@@ -21,6 +21,10 @@ from finbert_extractor import run_finbert_analysis, prepare_terms_for_explanatio
 from pipeline import run_full_pipeline, save_report, _compute_overall_risk
 from realtime import handle_realtime_websocket
 from memory_layer import get_memory_manager, generate_session_id
+from layer5_data_export import (
+    get_batch_processor, compute_analytics, compute_trends,
+    export_all_reports_csv, MIN_BATCH_SIZE, EXPORTS_DIR
+)
 
 # Load environment variables
 load_dotenv()
@@ -364,6 +368,143 @@ def get_report(filename: str):
 async def realtime_ws(websocket: WebSocket):
     """WebSocket endpoint for real-time call analysis."""
     await handle_realtime_websocket(websocket)
+
+
+# ── Layer 5: Batch Processing & CSV Export ─────────────────────────────────
+
+@app.post("/batch/create")
+async def create_batch():
+    """
+    Create a new batch for collecting multiple analyses.
+    Minimum 6 files required to generate CSV.
+    """
+    processor = get_batch_processor()
+    batch_id = processor.create_batch()
+    
+    return {
+        "batch_id": batch_id,
+        "status": "created",
+        "min_files_required": MIN_BATCH_SIZE,
+        "message": f"Add at least {MIN_BATCH_SIZE} files to generate CSV.",
+    }
+
+
+@app.post("/batch/{batch_id}/analyze")
+async def batch_analyze(
+    batch_id: str,
+    file: UploadFile = File(...),
+    language: str | None = None,
+    caller_id: str | None = None,
+):
+    """
+    Add a file to a batch and analyze it.
+    Returns progress toward CSV generation threshold.
+    """
+    processor = get_batch_processor()
+    
+    ext = os.path.splitext(file.filename)[1].lower()
+    if ext not in ALLOWED_EXTS:
+        raise HTTPException(400, f"Unsupported format: {ext}")
+    
+    timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_name = f"{timestamp_str}_{file.filename}"
+    dst = UPLOAD_DIR / safe_name
+    
+    try:
+        with open(dst, "wb") as buf:
+            shutil.copyfileobj(file.file, buf)
+        
+        # Run full pipeline
+        report = await run_full_pipeline(
+            str(dst), language,
+            caller_id=caller_id,
+            session_id=batch_id
+        )
+        
+        # Save report
+        await save_report(report)
+        
+        # Add to batch
+        batch_status = processor.add_report(batch_id, report)
+        
+        return {
+            "status": "success",
+            "audio_file": safe_name,
+            "batch_progress": batch_status,
+            "report_summary": {
+                "compliance_score": report.get("regulatory_compliance", {}).get("compliance_score"),
+                "risk_level": report.get("overall_risk", {}).get("level"),
+            },
+        }
+    
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(500, f"Batch analysis failed: {str(e)}")
+
+
+@app.post("/batch/{batch_id}/finalize")
+async def finalize_batch(batch_id: str):
+    """
+    Finalize a batch and generate CSV if threshold (6+ files) is met.
+    """
+    processor = get_batch_processor()
+    result = processor.finalize_batch(batch_id)
+    
+    if "error" in result:
+        raise HTTPException(400, result["error"])
+    
+    return result
+
+
+@app.get("/batch/{batch_id}/status")
+async def batch_status(batch_id: str):
+    """Get status of a batch."""
+    processor = get_batch_processor()
+    result = processor.get_batch_status(batch_id)
+    
+    if "error" in result:
+        raise HTTPException(404, result["error"])
+    
+    return result
+
+
+@app.get("/export/csv")
+async def export_csv():
+    """
+    Export all saved reports as CSV.
+    Requires minimum 6 reports.
+    """
+    csv_path, error = export_all_reports_csv()
+    
+    if error:
+        raise HTTPException(400, error)
+    
+    # Return file download
+    from fastapi.responses import FileResponse
+    return FileResponse(
+        csv_path,
+        media_type="text/csv",
+        filename=Path(csv_path).name
+    )
+
+
+@app.get("/analytics/summary")
+async def analytics_summary():
+    """
+    Get aggregate analytics from all saved reports.
+    Includes compliance scores, risk distributions, and totals.
+    """
+    return compute_analytics()
+
+
+@app.get("/analytics/trends")
+async def analytics_trends():
+    """
+    Get time-series data for visualization.
+    Shows compliance and risk scores over time.
+    """
+    return compute_trends()
 
 
 # ── Run ────────────────────────────────────────────────────────────────────
