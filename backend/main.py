@@ -131,10 +131,11 @@ async def transcribe_endpoint(file: UploadFile = File(...)):
 async def analyze_text(body: dict):
     """Layer 2 only: Run text processing on provided transcript text."""
     transcript = body.get("transcript", "")
+    language = body.get("language", "auto")
     if not transcript.strip():
         raise HTTPException(400, "No transcript provided")
 
-    result = run_layer2(transcript)
+    result = run_layer2(transcript, language=language)
     result["status"] = "success"
     return result
 
@@ -197,13 +198,7 @@ async def full_analysis(
 ):
     """
     FULL PIPELINE: Upload audio → Layer 1 → Layer 2 → Layer 3.
-    Returns complete compliance report with memory context.
-    
-    Args:
-        file: Audio file to analyze
-        language: Optional language hint (e.g. 'en', 'ru', 'hi')
-        caller_id: Optional caller identifier for memory persistence across calls
-        session_id: Optional session ID for grouping related analyses
+    Streams SSE progress events, then a final 'complete' event with the report.
     """
     ext = os.path.splitext(file.filename)[1].lower()
     if ext not in ALLOWED_EXTS:
@@ -213,26 +208,86 @@ async def full_analysis(
     safe_name = f"{timestamp_str}_{file.filename}"
     dst = UPLOAD_DIR / safe_name
 
-    try:
-        with open(dst, "wb") as buf:
-            shutil.copyfileobj(file.file, buf)
+    # Save uploaded file first (synchronous, before generator)
+    with open(dst, "wb") as buf:
+        shutil.copyfileobj(file.file, buf)
 
-        report = await run_full_pipeline(
-            str(dst), language,
-            caller_id=caller_id,
-            session_id=session_id
-        )
+    async def _stream():
+        try:
+            from layer3_backboard import initialize_assistants as _init_assistants
 
-        # Save report
-        report_path = await save_report(report)
-        report["report_path"] = report_path
+            start_time = datetime.now()
 
-        return report
+            # ── Layer 1 ──
+            yield _sse("progress", "layer1", "Running Layer 1: Audio forensics & transcription…")
+            layer1 = run_layer1(str(dst), language=language)
+            transcript = layer1.get("transcript", "")
 
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(500, f"Analysis failed: {str(e)}")
+            if not transcript or not transcript.strip():
+                yield f"data: {json.dumps({'type': 'error', 'message': 'Transcription returned empty — audio may be silent or corrupted.'})}\n\n"
+                return
+
+            detected_lang = layer1.get("language", "en")
+            yield _sse("progress", "layer1", f"Layer 1 complete — language: {detected_lang}, duration: {layer1.get('duration', 0):.1f}s")
+
+            # ── Layer 2 ──
+            yield _sse("progress", "layer2", "Running Layer 2: Text processing & PII detection…")
+            layer2 = run_layer2(transcript, language=detected_lang)
+            yield _sse("progress", "layer2", f"Layer 2 complete — PII: {layer2.get('pii_count', 0)}, risk: {layer2.get('risk_level', 'unknown')}")
+
+            # ── Layer 3 ──
+            yield _sse("progress", "layer3", "Running Layer 3: Backboard intelligence & compliance…")
+            layer3 = await run_layer3(
+                transcript, layer2,
+                session_id=session_id,
+                caller_id=caller_id,
+            )
+            yield _sse("progress", "layer3", "Layer 3 complete — building final report")
+
+            # ── Assemble report ──
+            elapsed = (datetime.now() - start_time).total_seconds()
+            report = {
+                "status": "success",
+                "processed_at": start_time.isoformat(),
+                "processing_time_seconds": round(elapsed, 2),
+                "audio_file": Path(str(dst)).name,
+                "session_id": layer3.get("session_id"),
+                "caller_id": layer3.get("caller_id"),
+                "transcript": transcript,
+                "language": detected_lang,
+                "duration_seconds": layer1["duration"],
+                "segments": layer1["segments"],
+                "audio_quality": layer1["audio_quality"],
+                "overall_confidence": layer1.get("overall_confidence"),
+                "emotion_analysis": layer1.get("emotion_analysis"),
+                "tamper_detection": layer1.get("tamper_detection"),
+                "pii_detected": layer2["pii_detected"],
+                "pii_count": layer2["pii_count"],
+                "financial_entities": layer2["financial_entities"],
+                "named_entities": layer2["named_entities"],
+                "profanity_findings": layer2["profanity_findings"],
+                "obligation_sentences": layer2["obligation_sentences"],
+                "text_risk_level": layer2["risk_level"],
+                "finbert_analysis": layer3.get("finbert_analysis"),
+                "financial_term_explanations": layer3.get("term_explanations"),
+                "obligation_analysis": layer3["obligation_analysis"],
+                "intent_classification": layer3["intent_classification"],
+                "regulatory_compliance": layer3["regulatory_compliance"],
+                "overall_risk": _compute_overall_risk(layer1, layer2, layer3),
+            }
+
+            # Save report
+            report_path = await save_report(report)
+            report["report_path"] = report_path
+
+            yield f"data: {json.dumps({'type': 'complete', 'report': report}, default=str, ensure_ascii=False)}\n\n"
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+
+    return StreamingResponse(_stream(), media_type="text/event-stream")
 
 
 # ── Get policy rules ──────────────────────────────────────────────────────
